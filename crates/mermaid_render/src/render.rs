@@ -4,12 +4,22 @@ use anyhow::{Context as _, Result, anyhow};
 
 use crate::{MermaidTheme, css_color};
 
-pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<String> {
+pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<(String, bool)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let diagram_id = format!("merman-{id}");
 
-    let config = to_merman_config(theme);
+    let (config, custom_palette) = config_for_source(source, theme)?;
+    let background = if let Some(background) = config.get_str("themeVariables.background") {
+        Some(background.to_owned())
+    } else {
+        merman::Engine::new()
+            .with_site_config(config.clone())
+            .parse_metadata_sync(source)?
+            .effective_config
+            .get_str("themeVariables.background")
+            .map(str::to_owned)
+    };
     let renderer = merman::svg::HeadlessRenderer::new()
         .with_site_config(config)
         .with_vendored_text_measurer()
@@ -17,17 +27,80 @@ pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<Strin
     // Apply merman's raster-safe pipeline before Zed-specific styling. The
     // pipeline handles generic rasterizer compatibility cleanup: foreignObject
     // fallback text, unsupported CSS removal, and invalid SVG attribute cleanup.
-    // Zed also strips merman's existing `!important` declarations before
-    // injecting its own theme CSS so host styling wins consistently in usvg/resvg.
-    let pipeline = merman::svg::SvgPipeline::resvg_safe()
-        .with_postprocessor(merman::svg::CssOverridePostprocessor::strip_existing_important());
+    // Author styles must retain their priority over host defaults.
+    let mut pipeline = merman::svg::SvgPipeline::resvg_safe();
+    if let Some(background) = background {
+        pipeline =
+            pipeline.with_postprocessor(merman::svg::RootBackgroundPostprocessor::new(background));
+    }
 
     let svg = renderer
         .render_svg_with_pipeline_sync(source, &pipeline)
         .context("merman render failed")?
         .ok_or_else(|| anyhow!("merman returned no SVG for the given input"))?;
 
-    Ok(svg)
+    Ok((svg, custom_palette))
+}
+
+fn config_for_source(source: &str, theme: &MermaidTheme) -> Result<(merman::MermaidConfig, bool)> {
+    let source = merman::preprocess_diagram(source, &merman::DetectorRegistry::default())?;
+    let mut config = to_merman_config(theme);
+    let explicit_theme = source.config.get_str("theme");
+    let custom_palette = explicit_theme.is_some_and(|name| name != "base")
+        || source.config.as_value().get("themeVariables").is_some();
+
+    if let Some(name) = explicit_theme {
+        anyhow::ensure!(
+            merman::supported_themes().contains(&name),
+            "Unsupported Mermaid theme: {name}"
+        );
+        config.set_value("theme", name.into());
+        if name != "base" {
+            config.set_value("themeVariables", serde_json::json!({}));
+        }
+    }
+
+    if let Some(variables) = source.config.as_value().get("themeVariables") {
+        let variables = variables
+            .as_object()
+            .context("Mermaid themeVariables must be an object")?;
+        for (key, value) in variables {
+            anyhow::ensure!(
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "Invalid Mermaid theme variable: {key}"
+            );
+            // Keep merman's secure source policy intact. Only parsed colors are
+            // promoted to site configuration, never arbitrary CSS or fonts.
+            let value = value
+                .as_str()
+                .with_context(|| format!("Mermaid color {key} must be a string"))?;
+            let color = merman::theme_color::ThemeColor::parse(value)
+                .with_context(|| format!("Unsupported Mermaid color {key}"))?;
+            config.set_value(&format!("themeVariables.{key}"), color.stringify().into());
+        }
+        // These site defaults otherwise mask Mermaid's derived primary colors.
+        for (primary, aliases) in [
+            ("primaryColor", &["mainBkg"][..]),
+            ("primaryBorderColor", &["nodeBorder"][..]),
+            ("primaryTextColor", &["nodeTextColor", "labelColor"][..]),
+        ] {
+            if let Some(value) = config
+                .get_str(&format!("themeVariables.{primary}"))
+                .map(str::to_owned)
+                && variables.contains_key(primary)
+            {
+                for alias in aliases {
+                    if !variables.contains_key(*alias) {
+                        config.set_value(&format!("themeVariables.{alias}"), value.clone().into());
+                    }
+                }
+            }
+        }
+    }
+    Ok((config, custom_palette))
 }
 
 fn to_merman_config(theme: &MermaidTheme) -> merman::MermaidConfig {
@@ -141,7 +214,7 @@ mod tests {
     fn render_stage_applies_resvg_safe_pipeline() {
         let html_label_source =
             "classDiagram\n    class Shelter {\n        -List~Animal~ animals\n    }";
-        let html_label_svg =
+        let (html_label_svg, _) =
             render_mermaid(html_label_source, &MermaidTheme::default()).expect("render failed");
 
         assert!(
@@ -154,14 +227,14 @@ mod tests {
         );
 
         let css_source = "sequenceDiagram\n    Alice->>Bob: Hello\n    Bob-->>Alice: Hi";
-        let css_svg = render_mermaid(css_source, &MermaidTheme::default()).expect("render failed");
+        let (css_svg, _) =
+            render_mermaid(css_source, &MermaidTheme::default()).expect("render failed");
 
         assert!(!css_svg.contains("@keyframes"), "got: {css_svg}");
         assert!(!css_svg.contains("@-webkit-keyframes"), "got: {css_svg}");
         assert!(!css_svg.contains(":root"), "got: {css_svg}");
         assert!(!css_svg.contains("animation:"), "got: {css_svg}");
         assert!(!css_svg.contains("animation-name:"), "got: {css_svg}");
-        assert!(!css_svg.contains("!important"), "got: {css_svg}");
     }
 
     #[test]
@@ -170,7 +243,7 @@ mod tests {
             A[\"Pass 2: search transcript with annotation blocks excised, \
             map offsets back to buffer space\"] --> \
             |ambiguous or zero| B[\"Error describing where matches were found\"]";
-        let svg = render_mermaid(source, &MermaidTheme::default()).expect("render failed");
+        let (svg, _) = render_mermaid(source, &MermaidTheme::default()).expect("render failed");
 
         assert!(!svg.contains("<foreignObject"), "got: {svg}");
         assert!(!svg.contains(
@@ -193,7 +266,7 @@ mod tests {
             }
         "#;
         let theme = MermaidTheme::default();
-        let svg = render_mermaid(source, &theme).expect("render failed");
+        let (svg, _) = render_mermaid(source, &theme).expect("render failed");
         let svg = crate::postprocess::postprocess(&svg, &theme).expect("postprocess failed");
         let mut options = usvg::Options::default();
         options.fontdb_mut().load_system_fonts();
@@ -224,7 +297,7 @@ mod tests {
                     Deployment
         "#;
         let theme = MermaidTheme::default();
-        let svg = render_mermaid(source, &theme).expect("render failed");
+        let (svg, _) = render_mermaid(source, &theme).expect("render failed");
         let svg = crate::postprocess::postprocess(&svg, &theme).expect("postprocess failed");
         let mut options = usvg::Options::default();
         options.fontdb_mut().load_system_fonts();

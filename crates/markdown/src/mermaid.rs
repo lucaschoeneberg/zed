@@ -442,11 +442,9 @@ fn is_supported_diagram_type(source: &str) -> bool {
         "xychart-beta",
         "journey",
     ];
-    let first_token = source
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == '\n')
-        .next()
-        .unwrap_or("");
+    let Ok(first_token) = mermaid_render::diagram_header(source) else {
+        return false;
+    };
     SUPPORTED_PREFIXES
         .iter()
         .any(|prefix| first_token.eq_ignore_ascii_case(prefix))
@@ -1126,6 +1124,30 @@ mod tests {
         assert_eq!(parse_mermaid_info("mermaid 5"), Some(10));
         assert_eq!(parse_mermaid_info("mermaid 999"), Some(500));
         assert_eq!(parse_mermaid_info("rust"), None);
+    }
+
+    #[test]
+    fn test_extract_mermaid_preserves_front_matter_and_directives() {
+        for source in [
+            "---\nconfig:\n  theme: base\n  themeVariables:\n    primaryColor: '#ff1234'\n---\nflowchart TD\n A --> B",
+            "%%{init: {'theme': 'forest'}}%%\n%% comment\nsequenceDiagram\n A->>B: Hello",
+        ] {
+            let markdown = format!("```mermaid\n{source}\n```");
+            let events =
+                crate::parser::parse_markdown_with_options(&markdown, false, false, false).events;
+            let diagrams = extract_mermaid_diagrams(&markdown, &events);
+            assert_eq!(diagrams.len(), 1);
+            assert_eq!(
+                diagrams
+                    .values()
+                    .next()
+                    .expect("diagram")
+                    .contents
+                    .contents
+                    .as_ref(),
+                source
+            );
+        }
     }
 
     #[test]

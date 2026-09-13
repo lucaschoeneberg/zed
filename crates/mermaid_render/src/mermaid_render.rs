@@ -7,9 +7,9 @@
 //!
 //! It takes a `&str` and a [`MermaidTheme`]. The output is an SVG with the
 //! following properties:
-//! - The style matches the provided theme
+//! - The provided theme supplies defaults; explicit diagram colors take priority.
 //! - Nodes are given accent colors, even if none are provided in the mermaid
-//!   source.
+//!   source, unless the diagram selects its own palette.
 //! - The SVG has been tweaked based on the assumption that it will be rasterized
 //!   using `usvg`/`resvg`. Some bugs/quirks of `usvg`/`resvg` are accounted for
 //!   in this crate.
@@ -174,17 +174,230 @@ pub(crate) fn css_color(color: Hsla) -> String {
 
 pub use postprocess::util::text_color_for_background;
 
+/// Renders a diagram using host colors as defaults. `style`, `classDef` and
+/// `linkStyle` colors retain their CSS priority. Front matter and init directives
+/// may select a Mermaid theme or override color-valued `themeVariables`; these
+/// disable host accent overlays for that diagram. Non-color theme variables and
+/// invalid colors return an error. Arbitrary `themeCSS` remains disabled by merman.
 /// See the [module-level docs][crate] for more info.
 #[ztracing::instrument(skip_all)]
 pub fn render_to_svg(source: &str, theme: &MermaidTheme) -> Result<String> {
-    let svg = render::render_mermaid(source, theme)?;
-    let svg = postprocess::postprocess(&svg, theme)?;
+    let (svg, custom_palette) = render::render_mermaid(source, theme)?;
+    let svg = if custom_palette {
+        postprocess::postprocess_with_palette(&svg, None)?
+    } else {
+        postprocess::postprocess(&svg, theme)?
+    };
     Ok(svg)
+}
+
+/// Returns the diagram header after Mermaid front matter, directives and comments.
+/// Invalid configuration returns an error; the original source should still be
+/// passed unchanged to [`render_to_svg`] so diagram settings are preserved.
+pub fn diagram_header(source: &str) -> Result<String> {
+    let source = merman::preprocess_diagram(source, &merman::DetectorRegistry::default())?;
+    Ok(source
+        .code()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_path_colors(source: &str, theme: &MermaidTheme) -> Vec<usvg::Color> {
+        fn collect(group: &usvg::Group, colors: &mut Vec<usvg::Color>) {
+            for node in group.children() {
+                match node {
+                    usvg::Node::Group(group) => collect(group, colors),
+                    usvg::Node::Path(path) => {
+                        if let Some(fill) = path.fill()
+                            && let usvg::Paint::Color(color) = fill.paint()
+                        {
+                            colors.push(*color);
+                        }
+                        if let Some(stroke) = path.stroke()
+                            && let usvg::Paint::Color(color) = stroke.paint()
+                        {
+                            colors.push(*color);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let svg = render_to_svg(source, theme).expect("diagram renders");
+        let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).expect("SVG parses");
+        let mut colors = Vec::new();
+        collect(tree.root(), &mut colors);
+        colors
+    }
+
+    #[test]
+    fn diagram_colors_override_host_defaults() {
+        let themes = [
+            MermaidTheme::default(),
+            MermaidTheme {
+                dark_mode: true,
+                primary_color: gpui::rgb(0x202020).into(),
+                background: gpui::rgb(0x101010).into(),
+                accent_colors: vec![AccentColor {
+                    foreground: gpui::rgb(0x345678).into(),
+                    background: gpui::rgb(0x234567).into(),
+                }],
+                ..MermaidTheme::default()
+            },
+        ];
+        for theme in themes {
+            for source in [
+                "flowchart TD\n A[Custom] --> B[Default]\n style A fill:#ff1234,stroke:#12ff34",
+                "flowchart TD\n A[Custom]:::custom --> B[Default]\n classDef custom fill:#ff1234,stroke:#12ff34",
+                "---\nconfig:\n  theme: base\n  themeVariables:\n    primaryColor: '#ff1234'\n    primaryBorderColor: '#12ff34'\n---\nflowchart TD\n A --> B",
+                "%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ff1234', 'primaryBorderColor': '#12ff34'}}}%%\nflowchart TD\n A --> B",
+            ] {
+                let colors = rendered_path_colors(source, &theme);
+                assert!(
+                    colors.contains(&usvg::Color::new_rgb(255, 18, 52)),
+                    "custom fill lost: {source}: {colors:?}"
+                );
+                assert!(
+                    colors.contains(&usvg::Color::new_rgb(18, 255, 52)),
+                    "custom stroke lost: {source}: {colors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_defaults_change_but_explicit_palettes_stay_fixed() {
+        let light = MermaidTheme::default();
+        let dark = MermaidTheme {
+            dark_mode: true,
+            primary_color: gpui::rgb(0x202020).into(),
+            background: gpui::rgb(0x101010).into(),
+            ..light.clone()
+        };
+        let plain = "flowchart TD\n A --> B";
+        assert_ne!(
+            rendered_path_colors(plain, &light),
+            rendered_path_colors(plain, &dark)
+        );
+        let preset = "---\nconfig:\n  theme: forest\n---\nflowchart TD\n A --> B";
+        assert_eq!(
+            rendered_path_colors(preset, &light),
+            rendered_path_colors(preset, &dark)
+        );
+        let partial = "---\nconfig:\n  themeVariables:\n    lineColor: '#ff1234'\n---\nflowchart TD\n A --> B";
+        assert!(rendered_path_colors(partial, &dark).contains(&usvg::Color::new_rgb(32, 32, 32)));
+        let explicit = "flowchart TD\n A --> B\n style A fill:#000000\n linkStyle 0 stroke:#ff1234";
+        let colors = rendered_path_colors(explicit, &dark);
+        assert!(colors.contains(&usvg::Color::new_rgb(0, 0, 0)));
+        assert!(colors.contains(&usvg::Color::new_rgb(255, 18, 52)));
+    }
+
+    #[test]
+    fn explicit_text_colors_survive_native_svg_fallback() {
+        fn text_color(group: &usvg::Group, label: &str) -> Option<usvg::Color> {
+            for node in group.children() {
+                match node {
+                    usvg::Node::Group(group) => {
+                        if let Some(color) = text_color(group, label) {
+                            return Some(color);
+                        }
+                    }
+                    usvg::Node::Text(text) => {
+                        for chunk in text.chunks() {
+                            if chunk.text() == label {
+                                let fill = chunk.spans().first()?.fill()?;
+                                if let usvg::Paint::Color(color) = fill.paint() {
+                                    return Some(*color);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut options = usvg::Options::default();
+        options.fontdb_mut().load_system_fonts();
+        for configuration in [
+            "",
+            "---\nconfig:\n  themeVariables:\n    primaryColor: '#eeeeee'\n---\n",
+        ] {
+            let source = format!(
+                "{configuration}flowchart LR\n A[Orange] --> B[Green]\n style A fill:#ffddaa,color:#332200\n classDef custom fill:#225544,color:#ffffff\n class B custom"
+            );
+            let theme = MermaidTheme {
+                background: gpui::rgb(0x101010).into(),
+                ..MermaidTheme::default()
+            };
+            let svg = render_to_svg(&source, &theme).expect("render");
+            assert!(
+                svg.contains("background-color:#101010"),
+                "host background lost: {}",
+                &svg[..svg.find('>').expect("root tag")]
+            );
+            let tree = usvg::Tree::from_str(&svg, &options).expect("SVG parses");
+            assert_eq!(
+                text_color(tree.root(), "Orange"),
+                Some(usvg::Color::new_rgb(51, 34, 0))
+            );
+            assert_eq!(
+                text_color(tree.root(), "Green"),
+                Some(usvg::Color::new_rgb(255, 255, 255))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_background_and_dark_preset_override_host_background() {
+        let theme = MermaidTheme {
+            background: gpui::rgb(0x101010).into(),
+            ..MermaidTheme::default()
+        };
+        let white = "---\nconfig:\n  themeVariables:\n    background: '#ffffff'\n---\nflowchart TD\n A --> B";
+        assert!(
+            render_to_svg(white, &theme)
+                .expect("white background")
+                .contains("background-color:#ffffff")
+        );
+        let dark = "---\nconfig:\n  theme: dark\n---\nflowchart TD\n A --> B";
+        assert!(
+            render_to_svg(dark, &theme)
+                .expect("dark preset")
+                .contains("background-color:#333")
+        );
+    }
+
+    #[test]
+    fn invalid_palette_values_cannot_become_site_css() {
+        for value in [
+            "red;stroke:blue",
+            "url(https://example.com/a.svg)",
+            "#fff}svg{fill:red",
+        ] {
+            let source = format!(
+                "---\nconfig:\n  themeVariables:\n    primaryColor: '{value}'\n---\nflowchart TD\n A --> B"
+            );
+            assert!(render_to_svg(&source, &MermaidTheme::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn diagram_header_accepts_configuration_and_comments() {
+        assert_eq!(
+            diagram_header(
+                "---\nconfig:\n  theme: base\n---\n%% comment\nsequenceDiagram\n A->>B: Hi"
+            )
+            .expect("header"),
+            "sequenceDiagram"
+        );
+    }
 
     #[test]
     fn mermaid_diagram_with_mixed_weight_combining_marks_does_not_panic() {
