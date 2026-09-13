@@ -176,19 +176,14 @@ pub use postprocess::util::text_color_for_background;
 
 /// Renders a diagram using host colors as defaults. `style`, `classDef` and
 /// `linkStyle` colors retain their CSS priority. Front matter and init directives
-/// may select a Mermaid theme or override color-valued `themeVariables`; these
+/// may override color-valued `themeVariables`; these
 /// disable host accent overlays for that diagram. Non-color theme variables and
 /// invalid colors return an error. Arbitrary `themeCSS` remains disabled by merman.
 /// See the [module-level docs][crate] for more info.
 #[ztracing::instrument(skip_all)]
 pub fn render_to_svg(source: &str, theme: &MermaidTheme) -> Result<String> {
     let (svg, custom_palette) = render::render_mermaid(source, theme)?;
-    let svg = if custom_palette {
-        postprocess::postprocess_with_palette(&svg, None)?
-    } else {
-        postprocess::postprocess(&svg, theme)?
-    };
-    Ok(svg)
+    postprocess::postprocess(&svg, theme, custom_palette)
 }
 
 /// Returns the diagram header after Mermaid front matter, directives and comments.
@@ -272,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn host_defaults_change_but_explicit_palettes_stay_fixed() {
+    fn host_defaults_change_while_individual_colors_stay_fixed() {
         let light = MermaidTheme::default();
         let dark = MermaidTheme {
             dark_mode: true,
@@ -284,11 +279,6 @@ mod tests {
         assert_ne!(
             rendered_path_colors(plain, &light),
             rendered_path_colors(plain, &dark)
-        );
-        let preset = "---\nconfig:\n  theme: forest\n---\nflowchart TD\n A --> B";
-        assert_eq!(
-            rendered_path_colors(preset, &light),
-            rendered_path_colors(preset, &dark)
         );
         let partial = "---\nconfig:\n  themeVariables:\n    lineColor: '#ff1234'\n---\nflowchart TD\n A --> B";
         assert!(rendered_path_colors(partial, &dark).contains(&usvg::Color::new_rgb(32, 32, 32)));
@@ -355,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_background_and_dark_preset_override_host_background() {
+    fn explicit_background_overrides_host_background() {
         let theme = MermaidTheme {
             background: gpui::rgb(0x101010).into(),
             ..MermaidTheme::default()
@@ -365,12 +355,6 @@ mod tests {
             render_to_svg(white, &theme)
                 .expect("white background")
                 .contains("background-color:#ffffff")
-        );
-        let dark = "---\nconfig:\n  theme: dark\n---\nflowchart TD\n A --> B";
-        assert!(
-            render_to_svg(dark, &theme)
-                .expect("dark preset")
-                .contains("background-color:#333")
         );
     }
 

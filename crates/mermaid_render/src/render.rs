@@ -10,16 +10,9 @@ pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<(Stri
     let diagram_id = format!("merman-{id}");
 
     let (config, custom_palette) = config_for_source(source, theme)?;
-    let background = if let Some(background) = config.get_str("themeVariables.background") {
-        Some(background.to_owned())
-    } else {
-        merman::Engine::new()
-            .with_site_config(config.clone())
-            .parse_metadata_sync(source)?
-            .effective_config
-            .get_str("themeVariables.background")
-            .map(str::to_owned)
-    };
+    let background = config
+        .get_str("themeVariables.background")
+        .map(str::to_owned);
     let renderer = merman::svg::HeadlessRenderer::new()
         .with_site_config(config)
         .with_vendored_text_measurer()
@@ -45,20 +38,7 @@ pub(super) fn render_mermaid(source: &str, theme: &MermaidTheme) -> Result<(Stri
 fn config_for_source(source: &str, theme: &MermaidTheme) -> Result<(merman::MermaidConfig, bool)> {
     let source = merman::preprocess_diagram(source, &merman::DetectorRegistry::default())?;
     let mut config = to_merman_config(theme);
-    let explicit_theme = source.config.get_str("theme");
-    let custom_palette = explicit_theme.is_some_and(|name| name != "base")
-        || source.config.as_value().get("themeVariables").is_some();
-
-    if let Some(name) = explicit_theme {
-        anyhow::ensure!(
-            merman::supported_themes().contains(&name),
-            "Unsupported Mermaid theme: {name}"
-        );
-        config.set_value("theme", name.into());
-        if name != "base" {
-            config.set_value("themeVariables", serde_json::json!({}));
-        }
-    }
+    let custom_palette = source.config.as_value().get("themeVariables").is_some();
 
     if let Some(variables) = source.config.as_value().get("themeVariables") {
         let variables = variables
@@ -267,7 +247,7 @@ mod tests {
         "#;
         let theme = MermaidTheme::default();
         let (svg, _) = render_mermaid(source, &theme).expect("render failed");
-        let svg = crate::postprocess::postprocess(&svg, &theme).expect("postprocess failed");
+        let svg = crate::postprocess::postprocess(&svg, &theme, false).expect("postprocess failed");
         let mut options = usvg::Options::default();
         options.fontdb_mut().load_system_fonts();
         let tree = usvg::Tree::from_str(&svg, &options).expect("SVG parsing failed");
@@ -298,7 +278,7 @@ mod tests {
         "#;
         let theme = MermaidTheme::default();
         let (svg, _) = render_mermaid(source, &theme).expect("render failed");
-        let svg = crate::postprocess::postprocess(&svg, &theme).expect("postprocess failed");
+        let svg = crate::postprocess::postprocess(&svg, &theme, false).expect("postprocess failed");
         let mut options = usvg::Options::default();
         options.fontdb_mut().load_system_fonts();
         let tree = usvg::Tree::from_str(&svg, &options).expect("SVG parsing failed");

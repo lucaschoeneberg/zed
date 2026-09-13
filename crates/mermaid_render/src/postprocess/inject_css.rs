@@ -373,7 +373,7 @@ fn build_injected_css(theme: &MermaidTheme, svg_id: &str) -> String {
 
     let raw_css = format!(
         r#"
-        text, tspan, foreignObject div, foreignObject span, foreignObject p {{ font-family: {font}; }}
+        text, tspan, foreignObject div, foreignObject span, foreignObject p {{ font-family: {font} !important; }}
         foreignObject div, foreignObject span, foreignObject p {{ font-size: 16px; color: {text}; }}
         .merman-foreignobject-fallback-text {{ font-size: 16px !important; }}
         foreignObject p {{ margin: 0; }}
@@ -458,8 +458,8 @@ fn build_injected_css(theme: &MermaidTheme, svg_id: &str) -> String {
         .dependency {{ fill: {line}; stroke: {line}; stroke-width: 1; }}
         .lollipop {{ fill: {primary}; stroke: {line}; stroke-width: 1; }}
         .sectionTitle0, .sectionTitle1, .sectionTitle2, .sectionTitle3 {{ fill: {text}; }}
-        .sectionTitle {{ font-family: {font}; }}
-        .taskTextOutsideRight {{ fill: {text}; font-family: {font}; }}
+        .sectionTitle {{ font-family: {font} !important; }}
+        .taskTextOutsideRight {{ fill: {text}; font-family: {font} !important; }}
         .taskTextOutsideLeft {{ fill: {text}; }}
         .active0, .active1, .active2, .active3 {{ fill: {secondary}; stroke: {border}; }}
         .activeText0, .activeText1, .activeText2, .activeText3 {{ fill: {text}; }}
@@ -471,8 +471,8 @@ fn build_injected_css(theme: &MermaidTheme, svg_id: &str) -> String {
         .activeCritText0, .activeCritText1, .activeCritText2, .activeCritText3 {{ fill: {warning_text}; }}
         .doneCrit0, .doneCrit1, .doneCrit2, .doneCrit3 {{ fill: {error}; stroke: {border}; stroke-width: 2; }}
         .doneCritText0, .doneCritText1, .doneCritText2, .doneCritText3 {{ fill: {error_text}; }}
-        .titleText {{ fill: {text}; font-family: {font}; }}
-        .grid .tick text {{ fill: {text}; font-family: {font}; }}
+        .titleText {{ fill: {text}; font-family: {font} !important; }}
+        .grid .tick text {{ fill: {text}; font-family: {font} !important; }}
         .grid .tick {{ stroke: {border}; }}
         {git_branch_css}
         .commit-merge {{ stroke: {primary}; fill: {primary}; }}

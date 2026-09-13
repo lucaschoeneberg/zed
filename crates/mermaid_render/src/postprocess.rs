@@ -19,15 +19,11 @@ pub(crate) mod util;
 
 use anyhow::{Context as _, Result};
 use quick_xml::Reader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::Event;
 
 use crate::MermaidTheme;
 
-pub(super) fn postprocess(svg: &str, theme: &MermaidTheme) -> Result<String> {
-    postprocess_with_palette(svg, Some(theme))
-}
-
-pub(super) fn postprocess_with_palette(svg: &str, theme: Option<&MermaidTheme>) -> Result<String> {
+pub(super) fn postprocess(svg: &str, theme: &MermaidTheme, custom_palette: bool) -> Result<String> {
     // merman 0.6 already applies the generic resvg-safe cleanup before this point.
     // The remaining passes are Zed-specific theme and accent adjustments.
     let svg_id = extract_svg_id(svg);
@@ -41,8 +37,8 @@ pub(super) fn postprocess_with_palette(svg: &str, theme: Option<&MermaidTheme>) 
     // <text> (e.g. user journey renders some labels both ways).
     let events = strip_foreignobject::process(events, svg);
     let events = events.map(|event| preserve_fallback_text_color(event?));
-    let events: Box<dyn Iterator<Item = Result<Event<'_>>>> = if let Some(theme) = theme {
-        let events = element_fixup::process(events, theme);
+    let events = element_fixup::process(events, theme, custom_palette);
+    let events: Box<dyn Iterator<Item = Result<Event<'_>>>> = if !custom_palette {
         let events = accent_colors::process(events, theme);
         Box::new(inject_css::process(events, theme, &svg_id))
     } else {
@@ -57,68 +53,53 @@ pub(super) fn postprocess_with_palette(svg: &str, theme: Option<&MermaidTheme>) 
 }
 
 fn preserve_fallback_text_color(event: Event<'_>) -> Result<Event<'_>> {
-    if let Event::Start(element) | Event::Empty(element) = &event
-        && element.name().as_ref() == b"g"
-        && accent_colors::is_foreign_object_fallback_group(element)?
-    {
-        let mut replacement = BytesStart::new("g");
-        for attribute in element.attributes() {
-            let attribute = attribute?;
-            if attribute.key.as_ref() != b"class" {
-                replacement.push_attribute(attribute);
-            }
-        }
-        // Copied node classes would apply shape fill rules to the moved text.
-        replacement.push_attribute(("class", "merman-foreignobject-fallback"));
-        return Ok(match event {
-            Event::Start(_) => Event::Start(replacement.into_owned()),
-            _ => Event::Empty(replacement.into_owned()),
-        });
-    }
     let element = match &event {
-        Event::Start(element) | Event::Empty(element) if element.name().as_ref() == b"text" => {
-            element
+        Event::Start(element) | Event::Empty(element) => element,
+        _ => return Ok(event),
+    };
+    let class = match element.name().as_ref() {
+        b"g" if accent_colors::is_foreign_object_fallback_group(element)? => {
+            "merman-foreignobject-fallback"
+        }
+        b"text"
+            if element
+                .try_get_attribute("class")?
+                .map(|class| {
+                    class.unescape_value().map(|class| {
+                        class
+                            .split_whitespace()
+                            .any(|class| class == "merman-foreignobject-fallback-text")
+                    })
+                })
+                .transpose()?
+                .unwrap_or(false) =>
+        {
+            "merman-foreignobject-fallback-text"
         }
         _ => return Ok(event),
     };
-    let is_fallback = element
-        .try_get_attribute("class")?
-        .map(|class| {
-            class.unescape_value().map(|class| {
-                class
-                    .split_whitespace()
-                    .any(|class| class == "merman-foreignobject-fallback-text")
-            })
-        })
-        .transpose()?
-        .unwrap_or(false);
-    if !is_fallback {
-        return Ok(event);
-    }
-    let Some(fill) = element.try_get_attribute("fill")? else {
-        return Ok(event);
-    };
-    let fill = fill.unescape_value()?;
-    let mut style = element
-        .try_get_attribute("style")?
-        .map(|style| style.unescape_value().map(|style| style.into_owned()))
-        .transpose()?
-        .unwrap_or_default();
-    // Merman resolves HTML label colors before moving fallback text out of
-    // the node. Keep that computed color above CSS for the new ancestry.
-    style.push_str(&format!(";fill:{fill} !important;"));
-    let mut replacement = BytesStart::new("text");
-    for attribute in element.attributes() {
-        let attribute = attribute?;
-        if !matches!(attribute.key.as_ref(), b"style" | b"class") {
-            replacement.push_attribute(attribute);
+    // Copied node classes apply shape fill rules to the moved fallback text.
+    let mut replacement = element_fixup::rewrite_attr(element, b"class", class)?;
+    if element.name().as_ref() == b"text"
+        && let Some(fill) = element.try_get_attribute("fill")?
+    {
+        let previous_style = element.try_get_attribute("style")?;
+        let mut style = previous_style
+            .as_ref()
+            .map(|style| style.unescape_value().map(|style| style.into_owned()))
+            .transpose()?
+            .unwrap_or_default();
+        // Keep the color merman resolved in the original HTML label context.
+        style.push_str(&format!(";fill:{} !important;", fill.unescape_value()?));
+        if previous_style.is_some() {
+            replacement = element_fixup::rewrite_attr(&replacement, b"style", &style)?;
+        } else {
+            replacement.push_attribute(("style", style.as_str()));
         }
     }
-    replacement.push_attribute(("class", "merman-foreignobject-fallback-text"));
-    replacement.push_attribute(("style", style.as_str()));
     Ok(match event {
-        Event::Start(_) => Event::Start(replacement.into_owned()),
-        _ => Event::Empty(replacement.into_owned()),
+        Event::Start(_) => Event::Start(replacement),
+        _ => Event::Empty(replacement),
     })
 }
 
